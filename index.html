@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#101827">
+<link rel="manifest" href="./manifest.webmanifest">
+<title>Fan ABS Live</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#f5f7fa;font-family:system-ui,-apple-system,sans-serif}
+.wrap{max-width:700px;margin:auto;padding:14px}.card{background:#171d25;border:1px solid #29313d;border-radius:18px;padding:15px;margin:12px 0}
+h1{margin:0;font-size:27px}.muted{color:#9da8b5}.small{font-size:13px}
+select{width:100%;padding:12px;border-radius:11px;border:1px solid #394352;background:#0f141a;color:#fff;font-size:16px;margin-top:8px}
+button{width:100%;padding:13px;border:0;border-radius:12px;background:#287df0;color:white;font-weight:800;font-size:16px;margin-top:8px}
+button.alt{background:#303946}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.stat{background:#0f141a;padding:10px;border-radius:12px;text-align:center}.big{font-size:23px;font-weight:800}
+.zone{height:330px;background:linear-gradient(#151a21,#0c1015);border-radius:14px;position:relative;margin-top:12px;overflow:hidden}
+.box{position:absolute;left:27%;right:27%;top:53px;height:225px;border:3px dashed #f2c94c}
+.plate{position:absolute;bottom:23px;left:20%;right:20%;height:25px;border:3px solid #eee;border-radius:4px}
+.ball{position:absolute;width:21px;height:21px;border-radius:50%;background:#fff;transform:translate(-50%,-50%);box-shadow:0 0 13px #fff;display:none}
+.pill{display:inline-block;padding:5px 8px;border-radius:999px;background:#252e39;font-size:12px;margin:2px}
+.status{text-align:center;font-size:20px;font-weight:800;padding:12px}.log{max-height:300px;overflow:auto}
+.pitch{padding:9px;border-bottom:1px solid #2b333e}.err{color:#ff9b9b}
+</style></head>
+<body><div class="wrap">
+<div class="card"><h1>⚾ Fan ABS Live</h1><div class="muted">Your personal, fan-only ABS challenge tracker. It cannot affect an MLB game.</div></div>
+<div class="card"><b>Today's MLB games</b><select id="games"><option>Loading…</option></select><button onclick="follow()">Follow selected game</button><div id="status" class="muted small">Connecting to MLB…</div></div>
+<div class="card"><b>Current matchup</b><div id="matchup" style="font-size:20px;font-weight:800;margin:7px 0">—</div><div id="players"><span class="pill">Batter: —</span><span class="pill">Pitcher: —</span></div></div>
+<div class="card"><div class="grid"><div class="stat"><div class="muted">Challenges</div><div id="ch" class="big">2</div></div><div class="stat"><div class="muted">Correct</div><div id="correct" class="big">0</div></div><div class="stat"><div class="muted">Accuracy</div><div id="accuracy" class="big">0%</div></div></div>
+<div class="zone"><div class="box"></div><div id="ball" class="ball"></div><div class="plate"></div></div>
+<div id="call" class="status">Select a game.</div><button onclick="challenge()">🚨 MY CHALLENGE</button><div class="muted small" style="margin-top:7px">A challenge succeeds only when the MLB called ball/strike differs from the calculated 2026 ABS zone.</div><button class="alt" onclick="resetStats()">Reset stats</button></div>
+<div class="card"><b>Recent pitches</b><div id="log" class="log muted">No pitches yet.</div></div>
+<div class="card"><b>MLB rosters & heights</b><select id="teams" onchange="roster()"><option>Loading teams…</option></select><div id="roster" class="small" style="margin-top:8px"></div></div>
+<div class="card muted small">Live data comes from MLB's publicly accessible Stats API. Pitch data may be delayed or revised.</div>
+</div>
+<script>
+const API="https://statsapi.mlb.com/api";
+let games=[],feed=null,pbp=null,pk=null,last=null,timer=null,seen=new Set();
+let stats=JSON.parse(localStorage.getItem("fanABS")||'{"ch":2,"correct":0,"total":0}');
+let batterInfo=null,batterCache=new Map();
+
+const $=x=>document.getElementById(x);
+async function get(u){let r=await fetch(u,{cache:"no-store"});if(!r.ok)throw Error(r.status);return r.json()}
+
+function drawStats(){
+  $("ch").textContent=stats.ch;
+  $("correct").textContent=stats.correct;
+  $("accuracy").textContent=(stats.total?Math.round(stats.correct/stats.total*100):0)+"%";
+  localStorage.setItem("fanABS",JSON.stringify(stats));
+}
+
+function parseHeight(h){
+  if(!h) return null;
+  const m=String(h).match(/^\s*(\d+)\s*'\s*(\d+)?\s*(?:"|in)?/);
+  if(!m) return null;
+  return Number(m[1]) + (Number(m[2]||0)/12);
+}
+
+async function getBatterInfo(batter){
+  if(!batter?.id) return null;
+  const id=String(batter.id);
+  if(batterCache.has(id)) return batterCache.get(id);
+
+  let info=null;
+  const gp=feed?.gameData?.players?.["ID"+id];
+  if(gp){
+    info={id:batter.id,name:gp.fullName||batter.fullName,height:gp.height||null};
+  }
+
+  if(!info?.height){
+    try{
+      const p=await get(API+"/v1/people/"+id);
+      const person=p.people?.[0];
+      if(person) info={id:batter.id,name:person.fullName||batter.fullName,height:person.height||null};
+    }catch(e){}
+  }
+
+  if(info) batterCache.set(id,info);
+  return info;
+}
+
+async function init(){
+  drawStats();
+  let d=new Date(),date=d.toISOString().slice(0,10);
+  try{
+    let x=await get(API+"/v1/schedule?sportId=1&date="+date);
+    games=x.dates?.[0]?.games||[];
+    $("games").innerHTML=games.length
+      ?games.map((g,i)=>`<option value="${i}">${g.teams.away.team.name} @ ${g.teams.home.team.name} — ${g.status.detailedState}</option>`).join("")
+      :"<option>No games today</option>";
+  }catch(e){$("status").innerHTML='<span class="err">Could not reach MLB.</span>'}
+  try{
+    let x=await get(API+"/v1/teams?sportId=1&activeStatus=Y");
+    $("teams").innerHTML=x.teams.map(t=>`<option value="${t.id}">${t.name}</option>`).join("");
+  }catch(e){}
+}
+
+async function follow(){
+  let g=games[+$("games").value];
+  if(!g)return;
+  pk=g.gamePk;seen=new Set();last=null;batterInfo=null;
+  $("status").textContent="Connecting to live pitch feed…";
+  if(timer)clearInterval(timer);
+  await refresh();
+  timer=setInterval(refresh,2500);
+}
+
+function key(p){return (p.about?.atBatIndex??"")+"-"+(p.index??"")+"-"+(p.pitchNumber??"")}
+function isPitch(p){return !!(p&&(p.isPitch||p.pitchData))}
+
+async function refresh(){
+  try{
+    [feed,pbp]=await Promise.all([
+      get(API+"/v1.1/game/"+pk+"/feed/live"),
+      get(API+"/v1/game/"+pk+"/playByPlay")
+    ]);
+
+    let ls=feed.liveData?.linescore,cur=feed.liveData?.plays?.currentPlay;
+    $("matchup").textContent=feed.gameData.teams.away.name+" "+(ls?.teams?.away?.runs??"")+" — "+(ls?.teams?.home?.runs??"")+" "+feed.gameData.teams.home.name;
+
+    $("players").innerHTML=`<span class="pill">Batter: ${cur?.matchup?.batter?.fullName||"—"}</span><span class="pill">Pitcher: ${cur?.matchup?.pitcher?.fullName||"—"}</span>`;
+
+    if(cur?.matchup?.batter?.id && cur.matchup.batter.id!==batterInfo?.id){
+      batterInfo=await getBatterInfo(cur.matchup.batter);
+      if(batterInfo?.height){
+        $("call").textContent="ABS zone loaded for "+batterInfo.name+" ("+batterInfo.height+")";
+      }
+    }
+
+    let events=[];
+    for(let p of (pbp.allPlays||[]))
+      for(let e of (p.playEvents||[]))
+        if(isPitch(e))events.push(e);
+
+    for(let e of events.slice(-10)){
+      let k=key(e);
+      if(!seen.has(k)){seen.add(k);show(e)}
+    }
+    if(events.length)last=events[events.length-1];
+
+    $("status").textContent="Live feed updated "+new Date().toLocaleTimeString();
+  }catch(e){
+    $("status").textContent="Waiting for live MLB feed…";
+  }
+}
+
+function show(p){
+  let d=p.details?.call?.description||p.details?.description||"Pitch";
+  let c=p.pitchData?.coordinates||{};
+  $("call").textContent=d;
+
+  if(Number.isFinite(c.pX)&&Number.isFinite(c.pZ)){
+    $("ball").style.display="block";
+    $("ball").style.left=Math.max(5,Math.min(95,50+c.pX*18))+"%";
+    $("ball").style.top=Math.max(8,Math.min(92,65-c.pZ*18))+"%";
+  }
+
+  let r=document.createElement("div");
+  r.className="pitch";
+  r.innerHTML="<b>"+d+"</b> · "+(p.details?.type?.description||"")+
+    (Number.isFinite(p.pitchData?.startSpeed)?" · "+Number(p.pitchData.startSpeed).toFixed(1)+" mph":"");
+  $("log").prepend(r);
+  if($("log").children.length>30)$("log").lastElementChild.remove();
+}
+
+function absResult(p){
+  const c=p?.pitchData?.coordinates||{};
+  const px=Number(c.pX), pz=Number(c.pZ);
+  if(!Number.isFinite(px)||!Number.isFinite(pz)||!batterInfo?.height) return null;
+
+  // 2026 MLB ABS: 17-inch zone, top 53.5% of batter height,
+  // bottom 27% of batter height, evaluated over the middle of the plate.
+  const h=parseHeight(batterInfo.height);
+  if(!h) return null;
+
+  const top=h*0.535;
+  const bottom=h*0.27;
+  const zoneHalfWidth=(17/12)/2; // 17 inches -> feet
+  const ballRadius=(2.9/12)/2;   // approx. MLB baseball radius in feet
+
+  const strike =
+    Math.abs(px) <= zoneHalfWidth + ballRadius &&
+    pz >= bottom - ballRadius &&
+    pz <= top + ballRadius;
+
+  return {strike,top,bottom,px,pz};
+}
+
+function challenge(){
+  if(stats.ch<=0){$("call").textContent="No challenges remaining";return}
+  if(!last){$("call").textContent="Waiting for a pitch…";return}
+
+  const result=absResult(last);
+  if(!result){
+    $("call").textContent="ABS location/height isn't available for this pitch yet.";
+    return;
+  }
+
+  stats.total++;
+
+  const ump=(last.details?.call?.description||"").toLowerCase();
+  const umpStrike=ump.includes("strike") && !ump.includes("ball");
+  const correctCall=(result.strike===umpStrike);
+
+  if(correctCall){
+    stats.ch--;
+    $("call").textContent="❌ Challenge unsuccessful — ABS says "+(result.strike?"STRIKE":"BALL");
+  }else{
+    stats.correct++;
+    $("call").textContent="✅ Challenge successful — ABS says "+(result.strike?"STRIKE":"BALL");
+  }
+
+  drawStats();
+}
+
+function resetStats(){
+  stats={ch:2,correct:0,total:0};
+  drawStats();
+}
+
+async function roster(){
+  let id=$("teams").value;
+  $("roster").textContent="Loading…";
+  try{
+    let x=await get(API+"/v1/teams/"+id+"/roster?rosterType=active&hydrate=person");
+    $("roster").innerHTML=x.roster.map(r=>`<div class="pitch"><b>${r.person?.fullName||"Unknown"}</b> · ${r.position?.abbreviation||""} · ${r.person?.height||"height unavailable"}</div>`).join("");
+  }catch(e){$("roster").textContent="Roster unavailable."}
+}
+
+if("serviceWorker" in navigator)navigator.serviceWorker.register("./sw.js");
+init();
+</script></body></html>
